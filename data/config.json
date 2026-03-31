@@ -1,0 +1,23 @@
+{
+  "region": "Texas - DFW Metro",
+  "state": "TX",
+  "metro": "Dallas-Fort Worth",
+  "bbox": {
+    "min_lat": 32.5,
+    "max_lat": 33.3,
+    "min_lon": -97.5,
+    "max_lon": -96.5
+  },
+  "target_station_types": ["ELEC"],
+  "analysis": {
+    "level2_coverage_radius_miles": 10,
+    "dcfc_coverage_radius_miles": 25,
+    "highway_dcfc_gap_miles": 50,
+    "urban_density_threshold_per_sqmi": 5000,
+    "stations_per_resident_benchmark": 0.0005
+  },
+  "quarterly_targets": {
+    "new_sites_approved_per_quarter": 5,
+    "coverage_gap_reduction_pct": 10
+  }
+}

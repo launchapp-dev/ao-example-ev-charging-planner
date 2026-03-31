@@ -1,0 +1,400 @@
+phases:
+  # ── Phase 1: Scrape existing station data via Playwright ──────────────────
+  scrape-station-data:
+    mode: agent
+    agent: data-scraper
+    directive: |
+      Scrape EV charging station data for the target region defined in data/config.json.
+      Use Playwright to navigate the AFDC Station Locator (https://afdc.energy.gov/stations)
+      and fetch station data via the AFDC API endpoint:
+        https://developer.nrel.gov/api/alt-fuel-stations/v1.json?api_key=DEMO_KEY&fuel_type=ELEC&state={{dispatch_input.state}}&limit=200
+      Also check PlugShare public data for the same region.
+      Save raw output to data/stations-raw.json and the cleaned, deduplicated version
+      to data/stations-clean.json.
+      Log the scrape run timestamp, record count, and any errors to data/scrape-log.json.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    retry_policy:
+      max_attempts: 3
+      backoff_seconds: 30
+
+  # ── Phase 2: Process station data with Python distance calculations ────────
+  process-station-data:
+    mode: command
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          set -e
+          echo "Processing station data for {{subject_title}}..."
+          cd {{project_root}}/examples/ev-charging-planner
+
+          # Validate data file exists
+          if [ ! -f data/stations-clean.json ]; then
+            echo "ERROR: data/stations-clean.json not found — scrape phase may have failed"
+            exit 1
+          fi
+
+          # Summarize station counts by connector type using jq
+          echo "Station breakdown by EV connector type:"
+          jq '[.[] | .ev_connector_types[]] | group_by(.) | map({connector: .[0], count: length}) | sort_by(-.count)' \
+            data/stations-clean.json > data/connector-summary.json
+          cat data/connector-summary.json
+
+          # Calculate coverage grid: 10-mile hex grid presence/absence
+          python3 - <<'PYEOF'
+          import json, math
+
+          with open("data/stations-clean.json") as f:
+              stations = json.load(f)
+
+          with open("data/config.json") as f:
+              config = json.load(f)
+
+          # Build a simple grid of 10-mile cells to detect gaps
+          bbox = config.get("bbox", {"min_lat": 32.0, "max_lat": 35.0, "min_lon": -97.0, "max_lon": -94.0})
+          grid_step = 0.145  # ~10 miles in degrees
+
+          lats = [s["latitude"] for s in stations if s.get("latitude")]
+          lons = [s["longitude"] for s in stations if s.get("longitude")]
+
+          gaps = []
+          lat = bbox["min_lat"]
+          while lat < bbox["max_lat"]:
+              lon = bbox["min_lon"]
+              while lon < bbox["max_lon"]:
+                  # Check if any station within 10 miles
+                  cell_lat, cell_lon = lat + grid_step/2, lon + grid_step/2
+                  covered = any(
+                      math.sqrt((s.get("latitude",0) - cell_lat)**2 + (s.get("longitude",0) - cell_lon)**2) < grid_step
+                      for s in stations if s.get("latitude") and s.get("longitude")
+                  )
+                  if not covered:
+                      gaps.append({"lat": round(cell_lat, 4), "lon": round(cell_lon, 4), "radius_miles": 10})
+                  lon += grid_step
+              lat += grid_step
+
+          with open("data/coverage-grid.json", "w") as f:
+              json.dump({"gap_count": len(gaps), "gaps": gaps[:100]}, f, indent=2)
+
+          print(f"Coverage analysis: {len(gaps)} gap cells found in region")
+          PYEOF
+
+          echo "Data processing complete."
+      cwd_mode: project_root
+      timeout_secs: 120
+
+  # ── Phase 3: Analyze coverage gaps ────────────────────────────────────────
+  analyze-coverage-gaps:
+    mode: agent
+    agent: gap-analyzer
+    directive: |
+      Analyze the EV charging coverage gaps for the target region.
+      Load data/stations-clean.json (scraped station data) and data/coverage-grid.json
+      (pre-computed gap grid from the processing phase).
+
+      Also load data/config.json for the region definition and any benchmarks.
+
+      Use sequential-thinking to work through these analysis dimensions:
+      1. Highway corridor gaps: identify stretches of major highways with no DCFC within 50 miles
+      2. Urban density gaps: census tracts with >5,000 pop/sq-mi and <1 Level 2 station per 2,000 residents
+      3. Workplace charging gaps: commercial/industrial zones with no Level 2 access
+      4. Equity gaps: low-income or minority census tracts below average station density
+
+      Check memory for previous coverage baselines and note any changes (improvement or regression).
+
+      Save the full gap analysis to reports/coverage-gaps.json in this structure:
+      {
+        "run_date": "<ISO date>",
+        "region": "<region name>",
+        "summary": { "total_gaps": N, "critical": N, "high": N, "medium": N, "low": N },
+        "gaps": [{ "id": "GAP-001", "type": "highway_corridor|urban_density|workplace|equity",
+                   "severity": "critical|high|medium|low", "description": "...",
+                   "center_lat": 0.0, "center_lon": 0.0, "radius_miles": 0,
+                   "recommended_sites": ["...", "..."] }]
+      }
+
+      Also save a brief coverage-gap-summary.md to reports/ for human review.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ── Phase 4: Generate candidate site list from gap analysis ──────────────
+  generate-candidate-list:
+    mode: command
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          set -e
+          cd {{project_root}}/examples/ev-charging-planner
+          mkdir -p data/candidates
+
+          python3 - <<'PYEOF'
+          import json, os
+
+          with open("reports/coverage-gaps.json") as f:
+              gaps = json.load(f)
+
+          with open("data/config.json") as f:
+              config = json.load(f)
+
+          candidates = []
+          for gap in sorted(gaps["gaps"], key=lambda g: ["critical","high","medium","low"].index(g["severity"])):
+              for i, site_desc in enumerate(gap.get("recommended_sites", [f"Site near ({gap['center_lat']:.3f}, {gap['center_lon']:.3f})"])):
+                  site_id = f"{gap['id']}-S{i+1:02d}"
+                  candidate = {
+                      "site_id": site_id,
+                      "gap_id": gap["id"],
+                      "gap_severity": gap["severity"],
+                      "gap_type": gap["type"],
+                      "description": site_desc,
+                      "lat": gap["center_lat"],
+                      "lon": gap["center_lon"],
+                      "status": "candidate",
+                      "created_date": config.get("run_date", "2026-01-01")
+                  }
+                  candidates.append(candidate)
+                  with open(f"data/candidates/{site_id}.json", "w") as f:
+                      json.dump(candidate, f, indent=2)
+
+          with open("data/candidate-list.json", "w") as f:
+              json.dump(candidates, f, indent=2)
+
+          print(f"Generated {len(candidates)} candidate site files")
+          PYEOF
+      cwd_mode: project_root
+      timeout_secs: 60
+
+  # ── Phase 5: Evaluate a candidate site (decision contract) ────────────────
+  evaluate-site:
+    mode: agent
+    agent: site-evaluator
+    directive: |
+      Evaluate the candidate EV charging sites listed in data/candidate-list.json.
+      Process sites in order of gap severity (critical first, then high, medium, low).
+      Limit this run to the top 5 unreviewed candidates (status == "candidate").
+
+      For each site:
+      1. Load its full data from data/candidates/<site-id>.json
+      2. Check memory for any prior evaluation notes on this site or the surrounding area
+      3. Apply the full evaluation rubric (grid, traffic, suitability, permitting, economics)
+      4. Save detailed assessment to reports/site-assessments/<site-id>.json
+
+      After evaluating all sites, produce a consolidated verdict summary.
+
+      Your decision contract output must include:
+      - verdict: "approve" | "conditional" | "reject" | "defer"
+      - reasoning: explanation of the overall batch result
+      - approved_sites: list of site IDs approved for permitting
+      - conditional_sites: list of site IDs with conditions, each with required_actions
+      - deferred_sites: list of site IDs deferred, each with data_needed
+      - rejected_sites: list of site IDs rejected with brief reason
+
+      If any CRITICAL gap sites come back as "defer" (missing data), set verdict to "rework"
+      so the data-scraper can attempt to gather the missing information.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    decision_contract:
+      required_fields:
+        - verdict
+        - reasoning
+        - approved_sites
+
+  # ── Phase 6: Collect missing data for deferred sites (rework target) ─────
+  collect-missing-data:
+    mode: agent
+    agent: data-scraper
+    directive: |
+      The site evaluation phase identified sites that need additional data before
+      a verdict can be reached. Review reports/site-assessments/ for any assessments
+      with status "deferred" and their data_needed fields.
+
+      For each deferred site:
+      1. Use Playwright to scrape the specific data requested:
+         - Traffic counts: check state DOT open data portals
+         - Utility territory: check utility service territory maps
+         - Zoning: check county GIS portals for parcel zoning data
+         - EV registration density: check state DMV open data
+      2. Append the newly gathered data to data/candidates/<site-id>.json
+      3. Update the site status from "deferred" to "data-collected"
+
+      Log what was found vs. still missing to data/data-collection-log.json.
+      If data was collected for at least one deferred site, this phase succeeds
+      and the workflow will re-enter site evaluation.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    retry_policy:
+      max_attempts: 2
+      backoff_seconds: 60
+
+  # ── Phase 7: Generate site assessment reports ─────────────────────────────
+  generate-assessment-reports:
+    mode: agent
+    agent: report-writer
+    directive: |
+      Generate professional site assessment reports for all sites evaluated in this run.
+      Read the assessment data from reports/site-assessments/ and produce polished
+      markdown reports.
+
+      For each site assessment JSON file:
+      1. Generate reports/site-assessments/<site-id>-report.md with the full assessment report
+      2. Include: executive summary, site scorecard table, financial model table,
+         permitting roadmap, and recommended next steps with owners
+
+      Also generate:
+      3. reports/coverage-gap-brief.md — a concise brief summarizing the coverage gap analysis
+         with the top priority gap zones and the candidate pipeline summary
+      4. reports/assessment-index.md — an index linking all site reports with one-line status
+
+      Read coverage-gaps.json and candidate-list.json for context.
+      Load prior report baselines from memory if available.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ── Phase 8: Manual gate — stakeholder review of approved sites ───────────
+  stakeholder-review:
+    mode: manual
+    directive: |
+      HUMAN REVIEW REQUIRED: Site assessment reports are ready for stakeholder review.
+
+      Please review the following before approving:
+      1. reports/assessment-index.md — overview of all evaluated sites
+      2. reports/coverage-gap-brief.md — coverage gap analysis summary
+      3. Individual site reports in reports/site-assessments/
+
+      Approve to proceed with permitting for the approved sites.
+      Reject to send back for re-evaluation with comments.
+
+      Key decisions:
+      - Are the approved sites aligned with the network expansion strategy?
+      - Are the conditional approvals' required actions feasible within budget?
+      - Should any deferred sites be escalated to approved given strategic priority?
+
+  # ── Phase 9: Initialize permit tracking for approved sites ────────────────
+  initialize-permit-tracking:
+    mode: command
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          set -e
+          cd {{project_root}}/examples/ev-charging-planner
+
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import date, timedelta
+
+          # Load approved sites from site assessments
+          approved = []
+          if os.path.exists("reports/site-assessments"):
+              for fname in os.listdir("reports/site-assessments"):
+                  if fname.endswith(".json"):
+                      with open(f"reports/site-assessments/{fname}") as f:
+                          assessment = json.load(f)
+                      if assessment.get("verdict") in ("approve", "conditional"):
+                          approved.append(assessment)
+
+          today = date.today().isoformat()
+          tracker = {}
+          if os.path.exists("data/permit-tracker.json"):
+              with open("data/permit-tracker.json") as f:
+                  tracker = json.load(f)
+
+          permits = tracker.get("permits", {})
+          for site in approved:
+              sid = site["site_id"]
+              if sid not in permits:
+                  permits[sid] = {
+                      "site_id": sid,
+                      "site_description": site.get("description", ""),
+                      "verdict": site["verdict"],
+                      "permit_status": "not_started",
+                      "utility_interconnect_status": "not_started",
+                      "application_submitted_date": None,
+                      "expected_permit_date": (date.today() + timedelta(days=90)).isoformat(),
+                      "actual_permit_date": None,
+                      "stalled": False,
+                      "last_update_date": today,
+                      "notes": []
+                  }
+                  print(f"Added {sid} to permit tracker")
+
+          tracker["permits"] = permits
+          tracker["last_updated"] = today
+          tracker["summary"] = {
+              "total": len(permits),
+              "not_started": sum(1 for p in permits.values() if p["permit_status"] == "not_started"),
+              "in_progress": sum(1 for p in permits.values() if p["permit_status"] == "in_progress"),
+              "approved": sum(1 for p in permits.values() if p["permit_status"] == "approved"),
+              "stalled": sum(1 for p in permits.values() if p.get("stalled"))
+          }
+
+          with open("data/permit-tracker.json", "w") as f:
+              json.dump(tracker, f, indent=2)
+          print(f"Permit tracker updated: {len(permits)} total permits")
+          PYEOF
+      cwd_mode: project_root
+      timeout_secs: 60
+
+  # ── Phase 10: Permit status check (runs on schedule) ─────────────────────
+  check-permit-status:
+    mode: agent
+    agent: permit-tracker
+    directive: |
+      Run a permit status check across all active permits in data/permit-tracker.json.
+
+      For each permit:
+      1. Check if expected_permit_date has passed — flag as OVERDUE if so
+      2. Check days since last_update_date — flag as STALLED if >14 days with no update
+      3. Note any permits in "in_progress" status for 60+ days (unusually slow)
+
+      Update the permit statuses based on any status changes you can determine from
+      available data (e.g., if a permit was submitted and enough time has passed for
+      typical approval, note that follow-up is due).
+
+      Generate data/permit-status-update.md with:
+      - Summary table of all permits with current status
+      - OVERDUE permits (table with site, expected date, days overdue)
+      - STALLED permits (table with site, days since update, recommended action)
+      - Action items for each stalled or overdue item
+
+      Update data/permit-tracker.json with refreshed summary stats and any stall flags.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ── Phase 11: Quarterly expansion report ─────────────────────────────────
+  quarterly-expansion-report:
+    mode: agent
+    agent: report-writer
+    directive: |
+      Generate the quarterly EV network expansion report.
+
+      Gather data from:
+      - data/permit-tracker.json — permit pipeline status
+      - reports/site-assessments/ — all assessed sites
+      - reports/coverage-gaps.json — current coverage gaps
+      - memory — historical baselines and prior quarter data
+
+      Produce reports/quarterly-expansion-report.md covering:
+      1. Executive Summary — headline metrics: new stations approved/under construction/operational
+      2. Network Coverage Progress — coverage gap reduction vs. last quarter (%)
+      3. Site Pipeline Status — funnel table: candidate → evaluated → approved → permitted → built
+      4. Permit Pipeline Health — on-track vs. stalled vs. overdue counts
+      5. Budget Tracker — estimated CapEx committed vs. prior quarter
+      6. Next Quarter Priorities — top 5 sites to prioritize for evaluation
+      7. Appendix — full site status table
+
+      Load prior quarter metrics from memory to compute quarter-over-quarter deltas.
+      Save current quarter summary to memory as the new baseline for next quarter's comparison.
+    capabilities:
+      mutates_state: true
+      writes_files: true

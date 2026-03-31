@@ -1,0 +1,18 @@
+schedules:
+  # Weekly coverage gap refresh — every Monday at 6 AM
+  - id: weekly-gap-refresh
+    cron: "0 6 * * 1"
+    workflow_ref: weekly-gap-refresh
+    enabled: true
+
+  # Weekly permit status check — every Wednesday at 8 AM
+  - id: weekly-permit-check
+    cron: "0 8 * * 3"
+    workflow_ref: permit-status-check
+    enabled: true
+
+  # Quarterly expansion report — first Monday of Jan, Apr, Jul, Oct at 7 AM
+  - id: quarterly-expansion
+    cron: "0 7 1-7 1,4,7,10 1"
+    workflow_ref: quarterly-expansion
+    enabled: true
